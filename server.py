@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 logging.basicConfig(level=logging.INFO)
 
 class SCSCProtocol(asyncio.Protocol):
@@ -28,21 +29,26 @@ class SCSCProtocol(asyncio.Protocol):
 	def eof_received(self):
 		...
 
+def do_nothing():
+	#Signals like the KeyboardInterrupt are not supported on windows.
+	#This workaround forces the loop to 'check' for keyboard interrupts once a second.
+	#See http://bugs.python.org/issue23057
+	while True:
+		yield from asyncio.sleep(1)
 
 def main():
-	loop = asyncio.get_event_loop()
+	loop = asyncio.get_event_loop()	
 	coro = loop.create_server(SCSCProtocol, '127.0.0.1', 26133)
 	server = loop.run_until_complete(coro)
 	logging.info('Looking for SCSCP connections on {}'.format(
 	  server.sockets[0].getsockname()))
 	
 	#Serve requests until CTRL+c is pressed
-	#Unfortunately this does not work on Windows due to 
+	print("Press control-C to stop the server.")
 	try:
-		print("Press control-C to stop the server.")
-		loop.run_forever()
+		loop.run_until_complete(do_nothing())
 	except KeyboardInterrupt:
-		pass
+		print("Closing the server.")
 	finally:
 		server.close()
 		#wait until the close method completes
