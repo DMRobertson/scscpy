@@ -5,23 +5,20 @@ import re
 
 from enum                  import Enum
 from xml.parsers.expat     import ParserCreate
-from xml.etree.ElementTree import _escape_attrib
+from xml.etree.ElementTree import _escape_attrib, TreeBuilder
 
 # logging.basicConfig(level=logging.INFO)
 logging.basicConfig(level=logging.DEBUG)
 
-
 class SessionState(Enum):
 	negotiation  = 0
-	transactions = 1
+	awaiting_transaction = 1
+	reading_transaction  = 2
 
 class SCSCProtocol(asyncio.Protocol):
 	#To provide a service, subclass and give this data?
 	service_name = None
 	service_version = None
-	
-	#SCSCP-specific data
-	scscp_versions = "1.3"
 	
 	#instance attributes
 	peername = None
@@ -38,81 +35,146 @@ class SCSCProtocol(asyncio.Protocol):
 		self.parser = ParserCreate()
 		self.parser.ProcessingInstructionHandler = self.instruction_received
 		
-		init_msg = instruction(
+		self.send_instruction(
 		  'service_name',    self.service_name,
 		  'service_version', self.service_version,
 		  'service_id',      os.getpid(),
-		  'scscp_versions',  self.scscp_versions
-		)
-		logging.debug("Begin connection initiation")
-		transport.write(init_msg.encode('UTF-8'))
-		logging.debug("Sent: {!r}".format(init_msg))
-		logging.info("Waiting for client response.")
+		  'scscp_versions',  "1.3")
 	
 	def connection_lost(self, exc):
-		logging.info('Lost connection to {}.')
+		if exc is None:
+			logging.info('Lost connection to {}.'.format(self.peername))
 		if exc is not None:
-			logging.info('Exception: {}'.format(self.peername, exc))
+			logging.warning('Lost connection to {} due to {}'.format(self.peername, exc))
 	
 	#Data streaming callbacks
 	def data_received(self, data):
-		message = data.decode()
+		message = data.decode('UTF-8')
 		logging.debug('Received: {!r}'.format(message))
 		self.parser.Parse(message)
-		
-		# print('Send: {!r}'.format(message))
-		# self.transport.write(data.upper())
-	
-		# print('Close the client socket')
-		# self.transport.close()
 	
 	def instruction_received(self, target, data):
-		data = data.strip()
-		logging.info("Received instruction: {!r}".format(data))
+		logging.debug("Received instruction: {!r}".format(data[:-1]))
 		if target != "scscp":
-			raise ValueError #todo: more specific details here
-		details = instruction_details(data)
-		logging.debug("Instructions parsed: {!r}".format(details))
+			logging.warning("Ignoring processing instruction with target {}".format(
+			  target))
+			return
 		
-		if 'quit' in details:
-			msg = "{} quit".format(self.peername)
-			if 'reason' in details:
-				msg += ' ({})'.format(details['reason'])
-			logging.info(msg)
+		key, attrs = instruction_details(data)
+		logging.debug("Instructions parsed: key={!r}, attrs={!r}".format(key, attrs))
+		
+		#first we deal with version negotiation
+		if self.state is SessionState.negotiation:
+			if not (key == 'quit' or 'version' in attrs):
+				logging.warning("Inappropirate instruction during version negotiation")
+				self.quit_session(reason="Only quit or version messages are allowed during negotiation")
+			
+			#We'll handle quit below
+			if 'version' in attrs:
+				client_versions = attrs['version'].split()
+				if "1.3" in client_versions:
+					self.send_instruction("version", "1.3")
+					self.state = SessionState.awaiting_transaction
+					logging.info("Version negotiation complete. Waiting for a transaction or instruction.")
+				else:
+					logging.warning("Client asked for unsupported versions {}".format(
+					  client_versions))
+					self.quit_session("not supported version")
+		
+		else: #We are not negotiating
+			if 'version' in attrs:
+				logging.warning('Client {} suppled a version outside of negotiation.'.format(
+				  self.peername))
+				self.quit_session("Version messages are only allowed during negotiation")
+		
+		#Now we deal with instructions which may be accepted at any time
+		if key == 'quit':
+			logging.info("Received quit instruction from {}".format(self.peername))
 			self.transport.close()
+			#todo stop/pause any calculations that are running?
+		elif 'info' in attrs:
+			logging.info("{} says: {!r}".format(self.peername, attrs['info']));
+		elif key == "start":
+			if self.state is not SessionState.awaiting_transaction:
+				logging.warning("Unexpected start instruction from {}".format(
+				  self.peername))
+			else:
+				self.state = SessionState.reading_transaction
+				logging.debug("Reading transaction from {}".format(self.peername))
+		elif key == "cancel":
+			if self.state is SessionState.reading_transaction:
+				logging.info("Transaction cancelled by {}".format(self.peername))
+				self.state = SessionState.awaiting_transaction
+			else:
+				logging.warning("Ignoring unexpected cancel instruction from {}".format(
+				  self.peername))
+		elif key == "end":
+			#parse the OM object that we ought to have received
+			logging.info("Transaction received from {}".format(self.peername))
+			self.state = SessionState.awaiting_transaction
+		elif key == "terminate":
+			... #todo
 	
-	def eof_received(self):
-		...
+	#SCSCP stuff
+	def send_instruction(self, *args):
+		msg = instruction(*args)
+		self.transport.write(msg.encode('UTF-8'))
+		logging.debug("Sent instruction: {!r}".format(msg))
+	
+	def quit_session(self, reason=None):
+		if reason is not None:
+			self.send_instruction('quit', 'reason', reason)
+		else:
+			self.send_instruction('quit')
+		self.transport.close()
+		logging.info("Closed connection to {}".format(self.peername))
 
-class AttrState(Enum):
-	key = 0
-	value = 1
-
+#Forming and parsing processing instructions
 find_attrs = re.compile("""
-(?:          #look for something matching
-  ([^=\s]+)    #key: non-empty seq of non-space non-equals characters
-  (?:          #optionally followed by a single
-    ="           #start value
-      ([^"]*)      #value: sequence of non-quote chars
-    "            #end value
-  )?
-)""", re.VERBOSE)
+(?:          #at most one occurance of 
+    (\w+)[ ] #an [alphanumerical string (key)], followed by a space
+)?
+(?:          #any occurances of
+  (\w+)      #an [alphanumerical string (attribute)], followed by a space
+  ="         #start value
+  ([^"]*)    #a [string of non-quote chars (value)]
+  "\s?        #end value, followed by a space
+)*
+""", re.VERBOSE)
 
 def instruction_details(data):
-	logging.debug(data)
+	chunks = find_attrs.match(data).groups()
+	logging.debug('chunks:' + repr(chunks))
+	if len(chunks) % 2 == 1:
+		key = chunks[0]
+		start = 1
+	else:
+		key = None
+		start = 0
 	attrs = {}
-	for match in find_attrs.finditer(data):
-		key, value = match.groups()
-		attrs[key] = value
-	return attrs
+	for i in range(start, len(chunks), 2):
+		attr, value = chunks[i], chunks[i+1]
+		if attr is None:
+			break
+		attrs[attr] = value
+	return key, attrs
 
 def instruction(*args):
-	assert len(args) % 2 == 0
-	details = ""
-	pairs = zip(args[::2], args[1::2])
-	for attrib, value in pairs:
+	if len(args) % 2 == 1:
+		details = args[0] + " "
+		start = 1
+	else:
+		details = ""
+		start = 0
+	for i in range(start, len(args), 2):
+		attrib, value = args[i], args[i+1]
 		details += "{}=\"{}\" ".format(attrib, _escape_attrib(str(value)))
 	return "<?scscp " + details + "?>\n"
+
+#Implement service as a subclass...somehow!
+class DummyService(SCSCProtocol):
+	service_name = "dummy"
+	service_version = "0.0.1"
 
 def do_nothing():
 	#Signals like the KeyboardInterrupt are not supported on windows.
@@ -121,15 +183,8 @@ def do_nothing():
 	while True:
 		yield from asyncio.sleep(1)
 
-
-
-
-class DummyService(SCSCProtocol):
-	service_name = "dummy"
-	service_version = "0.0.1"
-
 def main():
-	loop = asyncio.get_event_loop()	
+	loop = asyncio.get_event_loop()
 	coro = loop.create_server(DummyService, '127.0.0.1', 26133)
 	server = loop.run_until_complete(coro)
 	logging.info('Looking for SCSCP connections on {}'.format(
@@ -140,7 +195,7 @@ def main():
 	try:
 		loop.run_until_complete(do_nothing())
 	except KeyboardInterrupt:
-		print("Closing the server.")
+		logging.info("Closing the server.")
 	finally:
 		server.close()
 		#wait until the close method completes

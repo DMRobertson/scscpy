@@ -20,3 +20,23 @@ also <?scscp start ?>
 
 
 everything else is an open math object
+****
+At any stage:
+	receive info
+	receive quit
+
+Negotiation
+	send service info
+	receive preferred version
+	either:
+		send version to be used
+	or:
+		quit
+Accepting transactions
+	receive start
+		either:
+			receive OpenMath object
+			receive end
+		or:
+			begin to receive OpenMath object
+			receive cancel
