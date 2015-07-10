@@ -1,0 +1,22 @@
+<?scscp service_name="MuPADserver" service_version="1.1"
+service_id="host:26133" scscp_versions="1.0 3.4.1 1.2special" ?>
+
+<?scscp version="1.0" ?>
+<?scscp quit reason="explanation" ?> #reason optional, can appear anywhere
+
+#transaction blocks
+<?scscp start ?>
+[a valid OpenMath object]
+<?scscp end ?>
+
+also <?scscp start ?>
+13
+[something]
+<?scscp cancel ?>
+
+<?scscp info="some interesting information" ?>
+
+<?scscp terminate call_id="someidentifier" ?>
+
+
+everything else is an open math object
