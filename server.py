@@ -3,135 +3,153 @@ import logging
 import os
 import re
 
-from enum                  import Enum
-from xml.parsers.expat     import ParserCreate
 from xml.etree.ElementTree import _escape_attrib, TreeBuilder
+from xml.parsers.expat     import ParserCreate
 
-# logging.basicConfig(level=logging.INFO)
-logging.basicConfig(level=logging.DEBUG)
+#We begin with the code which starts the server and closes it on KeyboardInterrupt
+def main():
+	loop = asyncio.get_event_loop()
+	coro = asyncio.start_server(connection_callback, '127.0.0.1', 26133)
+	server = loop.run_until_complete(coro)
+	logger.info('Looking for SCSCP connections on {}'.format(
+	  server.sockets[0].getsockname()))
+	
+	#Serve requests until CTRL+c is pressed
+	logger.info("Press Control-C to stop the server.")
+	try:
+		loop.run_until_complete(do_nothing())
+	except KeyboardInterrupt:
+		logger.info("Closing the server.")
+	finally:
+		server.close()
+		loop.run_until_complete(server.wait_closed())
+		loop.close()
 
-class SessionState(Enum):
-	negotiation  = 0
-	awaiting_transaction = 1
-	reading_transaction  = 2
+def connection_callback(reader, writer):
+	SCSCPService(reader, writer)
 
-class SCSCProtocol(asyncio.Protocol):
-	#To provide a service, subclass and give this data?
-	service_name = None
+def do_nothing(seconds=1):
+	"""Signals like the KeyboardInterrupt are not supported on windows. This workaround forces the event loop to 'check' for keyboard interrupts once a second. See http://bugs.python.org/issue23057"""
+	while True:
+		yield from asyncio.sleep(seconds)
+
+#Next comes logging!
+def setup_logging(name):
+	"""My preferred setup for logging.
+	Levels INFO and higher are printed to stdout (the console).
+	Levels DEBUG and higher are written to a log file."""
+	logger = logging.getLogger(name)
+	logger.setLevel(logging.DEBUG)
+	
+	console = logging.StreamHandler()
+	console.setLevel(logging.INFO)
+	formatter = logging.Formatter('%(levelname)-8s %(name)-27s %(message)s')
+	console.setFormatter(formatter)
+	logger.addHandler(console)
+	
+	filename = 'logs/{}.log'.format(name)
+	os.makedirs(os.path.dirname(filename), exist_ok=True)
+	file = logging.FileHandler(filename, mode='wt', encoding='UTF-8')
+	file.setLevel(logging.DEBUG)
+	formatter = logging.Formatter('[%(asctime)s] %(levelname)-8s %(message)s')
+	file.setFormatter(formatter)
+	logger.addHandler(file)
+	
+	return logger
+
+logger = setup_logging('scscp server')
+setup_logging('asyncio')
+
+class SCSCPService:
+	"""This class implements the basics of the SCSCProtocol."""
+	#Attributes: internals
+	_reader = None
+	_writer = None
+	# _parser = None
+	
+	#Attributes
+	logger = None
+	client_name = None
+	
+	#Service-specific attributes (override in a subclass)
+	service_name    = None
 	service_version = None
 	
-	#instance attributes
-	peername = None
-	transport = None
-	state = None
-	parser = None
-	
-	#Connection callbacks
-	def connection_made(self, transport):
-		self.peername = transport.get_extra_info('peername')
-		logging.info('Connection from {}'.format(self.peername))
-		self.transport = transport
-		self.state = SessionState.negotiation
-		self.parser = ParserCreate()
-		self.parser.ProcessingInstructionHandler = self.instruction_received
+	def __init__(self, reader, writer):
+		"""The functions in :func:`main` which we imported from :mod:`py3:asyncio` ensure that an instance of this class is created whenever a connection is established. The arguments are :class:`py3:asyncio.StreamReader` and :class:`py3:asyncio.StreamWriter` instances, which handle boring things like buffering.
+		"""
+		self._reader = reader
+		self._writer = writer
+		# self._parser = ParserCreate()
+		ip, port = self._reader._transport.get_extra_info("peername")
+		self.client_name = ip + ":" + str(port)
+		self.logger = setup_logging("scscp " + self.client_name.replace(":", "-"))
+		# self.parser.ProcessingInstructionHandler = self.instruction_received
 		
+		self.logger.info("Connection established.")
+		self.negotiate_version()
+	
+	def negotiate_version(self):
+		negotiated = False
 		self.send_instruction(
 		  'service_name',    self.service_name,
 		  'service_version', self.service_version,
 		  'service_id',      os.getpid(),
 		  'scscp_versions',  "1.3")
-	
-	def connection_lost(self, exc):
-		if exc is None:
-			logging.info('Lost connection to {}.'.format(self.peername))
-		if exc is not None:
-			logging.warning('Lost connection to {} due to {}'.format(self.peername, exc))
-	
-	#Data streaming callbacks
-	def data_received(self, data):
-		message = data.decode('UTF-8')
-		logging.debug('Received: {!r}'.format(message))
-		self.parser.Parse(message)
-	
-	def instruction_received(self, target, data):
-		logging.debug("Received instruction: {!r}".format(data[:-1]))
-		if target != "scscp":
-			logging.warning("Ignoring processing instruction with target {}".format(
-			  target))
-			return
-		
-		key, attrs = instruction_details(data)
-		logging.debug("Instructions parsed: key={!r}, attrs={!r}".format(key, attrs))
-		
-		#first we deal with version negotiation
-		if self.state is SessionState.negotiation:
-			if not (key == 'quit' or 'version' in attrs):
-				logging.warning("Inappropirate instruction during version negotiation")
-				self.quit_session(reason="Only quit or version messages are allowed during negotiation")
-			
-			#We'll handle quit below
-			if 'version' in attrs:
-				client_versions = attrs['version'].split()
-				if "1.3" in client_versions:
-					self.send_instruction("version", "1.3")
-					self.state = SessionState.awaiting_transaction
-					logging.info("Version negotiation complete. Waiting for a transaction or instruction.")
-				else:
-					logging.warning("Client asked for unsupported versions {}".format(
-					  client_versions))
-					self.quit_session("not supported version")
-		
-		else: #We are not negotiating
-			if 'version' in attrs:
-				logging.warning('Client {} suppled a version outside of negotiation.'.format(
-				  self.peername))
-				self.quit_session("Version messages are only allowed during negotiation")
-		
-		#Now we deal with instructions which may be accepted at any time
+		line = yield from self._reader.readline()
+		self.logger.info(line)
+		key, attrs = self.next_instruction()
 		if key == 'quit':
-			logging.info("Received quit instruction from {}".format(self.peername))
-			self.transport.close()
-			#todo stop/pause any calculations that are running?
-		elif 'info' in attrs:
-			logging.info("{} says: {!r}".format(self.peername, attrs['info']));
-		elif key == "start":
-			if self.state is not SessionState.awaiting_transaction:
-				logging.warning("Unexpected start instruction from {}".format(
-				  self.peername))
+			pass #get rid of this object
+		elif 'version' in attrs:
+			client_versions = attrs['version'].split()
+			if "1.3" in client_versions:
+				self.send_instruction("version", "1.3")
+				negotiated = True
+				self.logging.info("Version negotiation complete")
+				#proceed into the main loop
 			else:
-				self.state = SessionState.reading_transaction
-				logging.debug("Reading transaction from {}".format(self.peername))
-		elif key == "cancel":
-			if self.state is SessionState.reading_transaction:
-				logging.info("Transaction cancelled by {}".format(self.peername))
-				self.state = SessionState.awaiting_transaction
-			else:
-				logging.warning("Ignoring unexpected cancel instruction from {}".format(
-				  self.peername))
-		elif key == "end":
-			#parse the OM object that we ought to have received
-			logging.info("Transaction received from {}".format(self.peername))
-			self.state = SessionState.awaiting_transaction
-		elif key == "terminate":
-			... #todo
+				self.logger.warning("Client asked for unsupported versions " + client_versions)
+				self.send_message("quit", "reason", "not supported version")
+				#close the connection
+		
+		if negotiated:
+			pass #start waiting for instructions
 	
-	#SCSCP stuff
 	def send_instruction(self, *args):
 		msg = instruction(*args)
-		self.transport.write(msg.encode('UTF-8'))
-		logging.debug("Sent instruction: {!r}".format(msg))
+		self._writer.write(msg.encode('UTF-8'))
+		self.logger.debug("Sent instruction: {!r}".format(msg))
 	
-	def quit_session(self, reason=None):
-		if reason is not None:
-			self.send_instruction('quit', 'reason', reason)
+	def next_instruction(self):
+		line = ""
+		while not line.startswith("<?"):
+			line = yield from self._reader.readline()
+			if not line:
+				raise Exception #todo: connection was closed?
+			line = line.decode('UTF-8').rstrip()
+		
+		return self.instruction_details(line)
+	
+	def instruction_details(self, line):
+		chunks = find_attrs.match(line).groups()
+		self.logger.debug('chunks:' + repr(chunks))
+		if len(chunks) % 2 == 1:
+			key = chunks[0]
+			start = 1
 		else:
-			self.send_instruction('quit')
-		self.transport.close()
-		logging.info("Closed connection to {}".format(self.peername))
+			key = None
+			start = 0
+		attrs = {}
+		for i in range(start, len(chunks), 2):
+			attr, value = chunks[i], chunks[i+1]
+			if attr is None:
+				break
+			attrs[attr] = value
+		return key, attrs
 
-#Forming and parsing processing instructions
 find_attrs = re.compile("""
-(?:          #at most one occurance of 
+(?:         #at most one occurance of 
     (\w+)[ ] #an [alphanumerical string (key)], followed by a space
 )?
 (?:          #any occurances of
@@ -142,24 +160,8 @@ find_attrs = re.compile("""
 )*
 """, re.VERBOSE)
 
-def instruction_details(data):
-	chunks = find_attrs.match(data).groups()
-	logging.debug('chunks:' + repr(chunks))
-	if len(chunks) % 2 == 1:
-		key = chunks[0]
-		start = 1
-	else:
-		key = None
-		start = 0
-	attrs = {}
-	for i in range(start, len(chunks), 2):
-		attr, value = chunks[i], chunks[i+1]
-		if attr is None:
-			break
-		attrs[attr] = value
-	return key, attrs
-
 def instruction(*args):
+	"""Forms an XML processing instruction (as a string) from the arguments. If there is an odd number of arguments, the first is taken to be a key. The rest are attribute/value pairs, in order. If an even number of arguments is given, they are all treated as attribute/value pairs."""
 	if len(args) % 2 == 1:
 		details = args[0] + " "
 		start = 1
@@ -170,38 +172,6 @@ def instruction(*args):
 		attrib, value = args[i], args[i+1]
 		details += "{}=\"{}\" ".format(attrib, _escape_attrib(str(value)))
 	return "<?scscp " + details + "?>\n"
-
-#Implement service as a subclass...somehow!
-class DummyService(SCSCProtocol):
-	service_name = "dummy"
-	service_version = "0.0.1"
-
-def do_nothing():
-	#Signals like the KeyboardInterrupt are not supported on windows.
-	#This workaround forces the loop to 'check' for keyboard interrupts once a second.
-	#See http://bugs.python.org/issue23057
-	while True:
-		yield from asyncio.sleep(1)
-
-def main():
-	loop = asyncio.get_event_loop()
-	coro = loop.create_server(DummyService, '127.0.0.1', 26133)
-	server = loop.run_until_complete(coro)
-	logging.info('Looking for SCSCP connections on {}'.format(
-	  server.sockets[0].getsockname()))
-	
-	#Serve requests until CTRL+c is pressed
-	print("Press control-C to stop the server.")
-	try:
-		loop.run_until_complete(do_nothing())
-	except KeyboardInterrupt:
-		logging.info("Closing the server.")
-	finally:
-		server.close()
-		#wait until the close method completes
-		loop.run_until_complete(server.wait_closed())
-		#nothing else is using the event loop so we can safely get rid of it
-		loop.close()
 
 if __name__ == "__main__":
 	main()
