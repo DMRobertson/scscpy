@@ -4,7 +4,7 @@ import os
 
 from xml.etree.ElementTree import _escape_attrib, XMLParser
 
-from .util    import setup_logging, xml_to_str
+from .util import setup_logging, pretty_xml_str
 
 class SCSCPService:
 	"""This class implements the basics of the SCSCProtocol."""
@@ -45,7 +45,7 @@ class SCSCPService:
 		
 		self.logger.debug("Received instruction: {!r}".format(line))
 		key, attrs = instruction_details(line)
-		self.logger.debug("Key = {}; attrs = {}".format(key, attrs))
+		self.logger.debug("key = {!r}; attrs = {}".format(key, attrs))
 		return key, attrs
 	
 	def send_instruction(self, *args):
@@ -93,8 +93,8 @@ class SCSCPService:
 		if key == "start":
 			self.logger.info("Receiving OpenMath object")
 			obj = yield from self.read_transaction()
-			#handle the object here
-			#todo: I think that obj will be none if the transaction fails
+			#I think that obj will be none if the transaction fails
+			self.handle_object(obj)
 		elif key == "cancel":
 			self.logger.error("Cancel instruction given before transaction")
 		elif key == "end":
@@ -123,17 +123,22 @@ class SCSCPService:
 		
 		if key == 'cancel':
 			self.logger.info('Transaction cancelled')
-			del parser
 		elif key == 'end':
 			self.logger.info('Transaction complete')
 			obj = parser.close()
-			#todo: check this is an openmath object
-			self.logger.debug(str(obj))
+			self.logger.debug(pretty_xml_str(obj))
 			return obj
 		elif key == 'start':
 			self.report_error("Start instruction given mid-transaction")
 		else:
 			self.report_error("Unrecognised instruction during transaction: key = {}, attrs = {}".format(key, attrs))
+	
+	#Interpreting the OpenMath objects
+	def handle_object(self, obj):
+		#1. Check that obj really does represent an openmath object
+		#2. See if we know what to do with that object
+		#3. If so, do it
+		...
 
 def instruction(*args):
 	"""Forms an XML processing instruction (as a string) from the arguments. If there is an odd number of arguments, the first is taken to be a key. The rest are attribute/value pairs, in order. If an even number of arguments is given, they are all treated as attribute/value pairs."""
