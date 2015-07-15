@@ -2,9 +2,11 @@ import asyncio
 import re
 import os
 
+from enum import Enum
 from xml.etree.ElementTree import _escape_attrib, XMLParser
 
-from .util import setup_logging, pretty_xml_str
+from .util     import setup_logging, pretty_xml_str
+from .openmath import verify_call
 
 class SCSCPService:
 	"""This class implements the basics of the SCSCProtocol."""
@@ -136,6 +138,7 @@ class SCSCPService:
 	#Interpreting the OpenMath objects
 	def handle_object(self, obj):
 		#1. Check that obj really does represent an openmath object
+		name_symbol, args, = verify_call(obj)
 		#2. See if we know what to do with that object
 		#3. If so, do it
 		...
@@ -178,3 +181,97 @@ parse_instruction = re.compile("""
   "\s?        #end value, followed by a space
 )*
 """, re.VERBOSE)
+
+#Handling transactions
+
+def verify_call(obj):
+	"""The only OM object that the client is allowed to send is a procedure call.
+	Everything else in the messages (and CDs) is either an argument to the call or some kind of extra data.
+	
+	Proceedure calls have the following structure:
+	<OMOBJ>
+		<OMATTR>
+			<!-- call_id and option_return_... are mandatory -->
+			<OMATP>
+				<OMS cd="scscp1" name="call_id" />
+				<OMSTR>call_identifier</OMSTR>
+				<OMS cd="scscp1" name="option_runtime" />
+				<OMI>runtime_limit_in_milliseconds</OMI>
+				<OMS cd="scscp1" name="option_min_memory" />
+				<OMI>minimal_memory_required_in_bytes</OMI>
+				<OMS cd="scscp1" name="option_max_memory" />
+				<OMI>memory_limit_in_bytes</OMI>
+				<OMS cd="scscp1" name="option_debuglevel" />
+				<OMI>debuglevel_value</OMI>
+				<OMS cd="scscp1" name="option_return_object" />
+				<OMSTR></OMSTR>
+			</OMATP>
+			<!-- Attribution pairs finished, now the procedure call -->
+			<OMA>
+				<OMS cd="scscp1" name="procedure_call" />
+				<OMA>
+					<OMS cd="..." name="..."/>
+					<!-- Argument 1 -->
+					<!-- ... -->
+					<!-- Argument M -->
+				</OMA>
+			</OMA>
+		</OMATTR>
+	</OMOBJ>
+	"""
+	assert obj.tag == 'OMOBJ'
+	attr = obj[0]
+	
+	assert attr.tag == 'OMATTR'
+	pairs, application = *attr
+	
+	assert application.tag == 'OMA'
+	symbol, args = *application
+	
+	assert symbol.tag == 'OMS'
+	assert symbol['cd'] == "scscp1"
+	assert symbol['name'] == "procedure_call"
+	
+	assert args.tag == 'OMA'
+	assert len(args) > 0
+	name_symbol = args[0]
+	
+	assert name_symbol.tag == 'OMS'
+	assert 'cd'   in name_symbol
+	assert 'name' in name_symbol
+	
+	#2. Now handle the extra information
+	assert pairs.tag == 'OMATP'
+	assert len(pairs) % 2 == 0
+	
+	extras = {}
+	call_id = None
+	return_type = None
+	
+	for i in range(0, len(pairs), 2):
+		symbol = pairs[i]
+		assert elem.tag == 'OMS'
+		assert symbol['cd'] == "scscp1"
+		name = symbol['name']
+		extras[name] = pairs[i+1]
+		
+		if name == 'call_id':
+			assert call_id is None
+			call_id = 'name[call_id]'
+		elif name.startswith('option_return_'):
+			assert return_type is None
+			return_type = ReturnTypes[name[14:]]
+	
+	#Some information is mandatory
+	assert call_id     is not None
+	assert return_type is not None
+	
+	return name_symbol, args[1:], extras
+
+class ReturnTypes(Enum):
+	nothing = 0
+	object  = 1
+	cookie  = 2
+
+
+
