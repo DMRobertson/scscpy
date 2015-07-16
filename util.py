@@ -13,6 +13,7 @@ def setup_logging(name):
 	
 	console = logging.StreamHandler()
 	console.setLevel(logging.INFO)
+	# console.setLevel(logging.DEBUG)
 	formatter = logging.Formatter('%(levelname)-8s %(name)-27s %(message)s')
 	console.setFormatter(formatter)
 	logger.addHandler(console)

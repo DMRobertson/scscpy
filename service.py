@@ -5,14 +5,14 @@ import os
 from enum import Enum
 from xml.etree.ElementTree import _escape_attrib, XMLParser
 
-from .util     import setup_logging, pretty_xml_str
-from .openmath import verify_call
+from .util                 import setup_logging, pretty_xml_str
 
 class SCSCPService:
 	"""This class implements the basics of the SCSCProtocol."""
 	#Internal attributes
 	_reader = None
 	_writer = None
+	_tasks  = None
 	
 	#Attributes
 	logger = None
@@ -25,6 +25,7 @@ class SCSCPService:
 	def __init__(self, reader, writer, client_name):
 		self._reader     = reader
 		self._writer     = writer
+		self._tasks      = {}
 		self.client_name = client_name
 		# self._parser = ParserCreate()
 		
@@ -95,20 +96,20 @@ class SCSCPService:
 		if key == "start":
 			self.logger.info("Receiving OpenMath object")
 			obj = yield from self.read_transaction()
-			#I think that obj will be none if the transaction fails
 			self.handle_object(obj)
 		elif key == "cancel":
 			self.logger.error("Cancel instruction given before transaction")
 		elif key == "end":
 			self.logger.error("End instruction given before transaction")
 		elif key == "quit":
-			#todo kill any computations that are running
+			for task in self._tasks.values():
+				task.cancel()
 			raise ClientQuitError(attrs)
 		elif key == "terminate":
 			if 'call_id' not in attrs:
 				self.report_error("Terminate instruction missing call_id")
 			else:
-				... #todo kill the given computation or inform client of error
+				self._tasks[attrs['call_id']].cancel()
 		elif "info" in attrs:
 			self.logger.info("Client says: " + attrs['info'])
 		else:
@@ -138,11 +139,39 @@ class SCSCPService:
 	#Interpreting the OpenMath objects
 	def handle_object(self, obj):
 		#1. Check that obj really does represent an openmath object
-		name_symbol, args, = verify_call(obj)
+		cd, name, id, rtype, args, extras = verify_call(obj)
+		self.logger.debug('Client request: {} {}\nCall {}.{} with args {}\nExtra info {}'.format(
+		  rtype, id, cd, name, args, extras))
+		
 		#2. See if we know what to do with that object
+		method_name = "proc_{}__{}".format(cd, name)
+		try:
+			handler = getattr(self, method_name)
+		except AttributeError:
+			raise #Unknown symbol error or something
+		if not asyncio.iscoroutine(handler):
+			raise SCSCPError
+		
 		#3. If so, do it
-		...
-
+		self.logger.info("Calling {}.{}".format(cd, name))
+		coro = handler(*args)
+		task = asyncio.async(coro)
+		callback = functools.partial(self.call_ended, id, rtype)
+		task.add_done_callback(callback)
+		self._tasks[id] = task
+	
+	def call_ended(self, id, rtype, task):
+		del self._tasks[id]
+		if task.cancelled():
+			#terminated by client. Send procedure_terminated
+			...
+		elif task.exception() is not None:
+			#Some sort of internal error. Send procedure_terminated
+			...
+		else:
+			#Some sort of internal error. Send procedure_completed
+			...
+	
 def instruction(*args):
 	"""Forms an XML processing instruction (as a string) from the arguments. If there is an odd number of arguments, the first is taken to be a key. The rest are attribute/value pairs, in order. If an even number of arguments is given, they are all treated as attribute/value pairs."""
 	if len(args) % 2 == 1:
@@ -223,22 +252,22 @@ def verify_call(obj):
 	attr = obj[0]
 	
 	assert attr.tag == 'OMATTR'
-	pairs, application = *attr
+	pairs, application = attr
 	
 	assert application.tag == 'OMA'
-	symbol, args = *application
+	symbol, args = application
 	
 	assert symbol.tag == 'OMS'
-	assert symbol['cd'] == "scscp1"
-	assert symbol['name'] == "procedure_call"
+	assert symbol.get('cd') == "scscp1"
+	assert symbol.get('name') == "procedure_call"
 	
 	assert args.tag == 'OMA'
 	assert len(args) > 0
 	name_symbol = args[0]
 	
 	assert name_symbol.tag == 'OMS'
-	assert 'cd'   in name_symbol
-	assert 'name' in name_symbol
+	cd = name_symbol.get('cd')
+	proc_name = name_symbol.get('name')
 	
 	#2. Now handle the extra information
 	assert pairs.tag == 'OMATP'
@@ -250,14 +279,15 @@ def verify_call(obj):
 	
 	for i in range(0, len(pairs), 2):
 		symbol = pairs[i]
-		assert elem.tag == 'OMS'
-		assert symbol['cd'] == "scscp1"
-		name = symbol['name']
+		assert symbol.tag == 'OMS'
+		assert symbol.get('cd') == "scscp1"
+		name = symbol.get('name')
 		extras[name] = pairs[i+1]
 		
 		if name == 'call_id':
 			assert call_id is None
-			call_id = 'name[call_id]'
+			call_id = pairs[i+1].text
+			print(call_id)
 		elif name.startswith('option_return_'):
 			assert return_type is None
 			return_type = ReturnTypes[name[14:]]
@@ -266,7 +296,7 @@ def verify_call(obj):
 	assert call_id     is not None
 	assert return_type is not None
 	
-	return name_symbol, args[1:], extras
+	return cd, proc_name, call_id, return_type, args[1:], extras
 
 class ReturnTypes(Enum):
 	nothing = 0
