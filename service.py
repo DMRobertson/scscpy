@@ -148,7 +148,11 @@ class SCSCPService:
 		try:
 			handler = getattr(self, method_name)
 		except AttributeError:
-			raise #Unknown symbol error or something
+			self.report_error("Unknown symbol: cd={}, name={}".format(cd, name))
+			#TODO: Should really send procedure_terminated. Not sure what error symbol tho
+			return
+			
+			
 		if not asyncio.iscoroutine(handler):
 			raise SCSCPError
 		
